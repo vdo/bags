@@ -3,17 +3,18 @@ name: Release
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-*"
-    branches:
-      - main
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
 
-permissions:
-  contents: write
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -24,10 +25,6 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-
-    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -37,13 +34,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation deps (aarch64-linux)
+      - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libdbus-1-dev
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Install linux deps (x86_64-linux)
+      - name: Install linux deps
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt-get update
@@ -56,38 +53,35 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Package
+        shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../bags-${{ matrix.target }}.tar.gz bags
-          cd ../../..
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../bags-${{ matrix.target }}.zip bags.exe
-          cd ../../..
+          tar czvf ../../../bags-${{ github.ref_name }}-${{ matrix.target }}.tar.gz bags
+          cd -
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bags-${{ matrix.target }}
-          path: bags-${{ matrix.target }}.*
+          path: bags-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   release:
+    name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Create GitHub Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
           files: artifacts/*
+          generate_release_notes: true
