@@ -46,6 +46,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_input_popup(f, app);
     }
 
+    if app.input_mode == InputMode::EditingAlert {
+        draw_alert_popup(f, app);
+    }
+
+    if app.input_mode == InputMode::EditingBuyPrice {
+        draw_buyprice_popup(f, app);
+    }
+
     if app.input_mode == InputMode::Settings {
         draw_settings(f, app);
     }
@@ -72,7 +80,7 @@ fn draw_lock_screen(f: &mut Frame, app: &App) {
     f.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(" [bags] ")
+        .title(" bags ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border));
 
@@ -122,22 +130,15 @@ fn draw_lock_screen(f: &mut Frame, app: &App) {
 
 fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let refresh_info = if app.loading {
-        "loading...".to_string()
-    } else if app.last_refresh_display.is_empty() {
-        String::new()
-    } else {
-        app.last_refresh_display.clone()
-    };
 
     let tabs_list = [Tab::Markets, Tab::Favourites, Tab::Portfolio];
     let mut spans: Vec<Span> = Vec::new();
 
     spans.push(Span::styled(
-        " [bags] ",
+        " bags ",
         Style::default().fg(t.title).add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled("\u{2502} ", Style::default().fg(t.dim)));
+    spans.push(Span::styled("\u{2689} ", Style::default().fg(t.dim)));
 
     for (i, tab) in tabs_list.iter().enumerate() {
         if i > 0 {
@@ -155,6 +156,35 @@ fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
     }
+
+    // Global market stats
+    if let Some(ref stats) = app.global_stats {
+        spans.push(Span::styled(" \u{2502} ", Style::default().fg(t.dim)));
+        spans.push(Span::styled(
+            format!("MCap(USD):{} ", format_large(stats.total_market_cap_usd)),
+            Style::default().fg(t.dim),
+        ));
+        spans.push(Span::styled(
+            format!("BTC Dom:{:.1}% ", stats.btc_dominance),
+            Style::default().fg(t.accent),
+        ));
+        if let (Some(idx), Some(ref label)) = (stats.fear_greed_index, &stats.fear_greed_label) {
+            let fg_color = if idx >= 60 { t.positive } else if idx <= 40 { t.negative } else { t.dim };
+            spans.push(Span::styled(
+                format!("F&G:{} {} ", idx, label),
+                Style::default().fg(fg_color),
+            ));
+        }
+    }
+
+    // Right-align refresh info
+    let refresh_info = if app.loading {
+        "loading...".to_string()
+    } else if app.last_refresh_display.is_empty() {
+        String::new()
+    } else {
+        app.last_refresh_display.clone()
+    };
 
     if !refresh_info.is_empty() {
         let used: usize = spans.iter().map(|s| s.content.len()).sum();
@@ -174,6 +204,17 @@ fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // -- Main table --
+
+fn sort_indicator(app: &App, col: SortColumn) -> &'static str {
+    if app.sort_column == Some(col) {
+        match app.sort_direction {
+            SortDirection::Asc => " \u{25b4}",
+            SortDirection::Desc => " \u{25be}",
+        }
+    } else {
+        ""
+    }
+}
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let t = &app.theme;
@@ -203,7 +244,11 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
         let msg = match app.tab {
             Tab::Favourites => "  No favourites yet. Press 'f' to favourite a coin.",
             Tab::Portfolio => "  No holdings. Press 'a' to add a holding.",
-            _ => "  No data.",
+            _ => if !app.filter_query.is_empty() {
+                "  No matches for filter."
+            } else {
+                "  No data."
+            },
         };
         let p = Paragraph::new(msg).style(Style::default().fg(t.dim));
         f.render_widget(p, area);
@@ -213,10 +258,24 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let is_portfolio = app.tab == Tab::Portfolio;
 
     let header_cells = {
-        let mut h = vec!["#", "Name", "Ticker", "Price", "1h%", "24h%", "7d%", "Volume", "MCap"];
+        let mut h = vec![
+            format!("#{}", sort_indicator(app, SortColumn::Rank)),
+            format!("Name{}", sort_indicator(app, SortColumn::Name)),
+            "Ticker".to_string(),
+            format!("Price{}", sort_indicator(app, SortColumn::Price)),
+            format!("1h%{}", sort_indicator(app, SortColumn::Change1h)),
+            format!("24h%{}", sort_indicator(app, SortColumn::Change24h)),
+            format!("7d%{}", sort_indicator(app, SortColumn::Change7d)),
+            "24h Hi".to_string(),
+            "24h Lo".to_string(),
+            format!("Volume{}", sort_indicator(app, SortColumn::Volume)),
+            format!("MCap{}", sort_indicator(app, SortColumn::MarketCap)),
+        ];
         if is_portfolio {
-            h.push("Qty");
-            h.push("Value");
+            h.push("Qty".to_string());
+            h.push("Value".to_string());
+            h.push("P&L".to_string());
+            h.push("P&L%".to_string());
         }
         h
     };
@@ -224,7 +283,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let header = Row::new(
         header_cells
             .iter()
-            .map(|h| Cell::from(*h).style(Style::default().fg(t.dim))),
+            .map(|h| Cell::from(h.as_str()).style(Style::default().fg(t.dim))),
     )
     .height(1);
 
@@ -236,6 +295,9 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let accent = t.accent;
     let highlight_bg = t.highlight_bg;
     let highlight_fg = t.highlight_fg;
+
+    // Check for alert flash
+    let flash_coin_id = app.alert_flash.as_ref().map(|(id, _)| id.clone());
 
     let rows: Vec<Row> = visible
         .iter()
@@ -250,6 +312,8 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
             let h1 = format_pct(coin.price_change_percentage_1h_in_currency);
             let h24 = format_pct(coin.price_change_percentage_24h_in_currency);
             let d7 = format_pct(coin.price_change_percentage_7d_in_currency);
+            let hi24 = coin.high_24h.map(|v| format_price(v)).unwrap_or_else(|| "--".into());
+            let lo24 = coin.low_24h.map(|v| format_price(v)).unwrap_or_else(|| "--".into());
             let vol = format_large(coin.total_volume);
             let mcap = format_large(coin.market_cap);
 
@@ -261,6 +325,8 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
                 pct_cell(coin.price_change_percentage_1h_in_currency, &h1, positive, negative, dim),
                 pct_cell(coin.price_change_percentage_24h_in_currency, &h24, positive, negative, dim),
                 pct_cell(coin.price_change_percentage_7d_in_currency, &d7, positive, negative, dim),
+                Cell::from(hi24).style(Style::default().fg(dim)),
+                Cell::from(lo24).style(Style::default().fg(dim)),
                 Cell::from(vol).style(Style::default().fg(dim)),
                 Cell::from(mcap).style(Style::default().fg(dim)),
             ];
@@ -270,10 +336,30 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
                 let val = amt * coin.current_price;
                 cells.push(Cell::from(format_amount(amt)).style(Style::default().fg(fg)));
                 cells.push(Cell::from(format_price(val)).style(Style::default().fg(accent)));
+
+                // P&L
+                if let Some(buy) = app.buy_price_for(&coin.id) {
+                    let pnl = (coin.current_price - buy) * amt;
+                    let pnl_pct = if buy > 0.0 { ((coin.current_price - buy) / buy) * 100.0 } else { 0.0 };
+                    let pnl_color = if pnl >= 0.0 { positive } else { negative };
+                    let sign = if pnl >= 0.0 { "+" } else { "" };
+                    cells.push(Cell::from(format!("{}{}", sign, format_price(pnl.abs()))).style(
+                        Style::default().fg(pnl_color),
+                    ));
+                    cells.push(Cell::from(format!("{}{:.1}%", sign, pnl_pct)).style(
+                        Style::default().fg(pnl_color),
+                    ));
+                } else {
+                    cells.push(Cell::from("--").style(Style::default().fg(dim)));
+                    cells.push(Cell::from("--").style(Style::default().fg(dim)));
+                }
             }
 
+            let is_flashing = flash_coin_id.as_deref() == Some(&coin.id);
             let style = if i == app.selected {
                 Style::default().bg(highlight_bg).fg(highlight_fg)
+            } else if is_flashing {
+                Style::default().bg(t.accent).fg(t.bg)
             } else {
                 Style::default().bg(bg)
             };
@@ -285,28 +371,34 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let widths = if is_portfolio {
         vec![
             Constraint::Length(4),
-            Constraint::Min(12),
+            Constraint::Min(10),
             Constraint::Length(6),
-            Constraint::Length(12),
+            Constraint::Length(11),
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(8),
         ]
     } else {
         vec![
             Constraint::Length(4),
-            Constraint::Min(14),
+            Constraint::Min(12),
             Constraint::Length(6),
-            Constraint::Length(12),
+            Constraint::Length(11),
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(9),
         ]
     };
 
@@ -317,7 +409,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
         block = block.title(Line::from(vec![
             Span::styled(" Total: ", Style::default().fg(t.dim)),
             Span::styled(
-                format!("${} ", format_price(total)),
+                format!("{}{} ", currency_symbol(&app.config.currency), format_price(total)),
                 Style::default().fg(t.title).add_modifier(Modifier::BOLD),
             ),
         ])).title_alignment(ratatui::layout::Alignment::Right);
@@ -335,23 +427,49 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_bottom_bar(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
+
+    // Filter bar mode
+    if app.input_mode == InputMode::Filtering {
+        let n = app.visible_coins().len();
+        let text = format!(" / {}_  ({} results)", app.filter_query, n);
+        let bar = Paragraph::new(text).style(Style::default().fg(t.input_accent));
+        f.render_widget(bar, area);
+        return;
+    }
+
+    // Sort picking mode
+    if app.sort_picking {
+        let bar = Paragraph::new(" Sort: r)ank  n)ame  p)rice  1)h  2)4h  7)d  v)ol  m)cap  Esc)clear ")
+            .style(Style::default().fg(t.input_accent));
+        f.render_widget(bar, area);
+        return;
+    }
+
     let hints = if app.popup_open {
         " Esc close | h/l cycle view "
     } else if app.input_mode == InputMode::Settings {
         " j/k navigate | Enter edit | s save | Esc cancel "
     } else {
         match app.tab {
-            Tab::Markets => " j/k scroll | Tab switch | Enter details | f fav | a hold | c add coin | S settings | q quit ",
-            Tab::Favourites => " j/k scroll | Tab switch | Enter details | f unfav | a hold | c add coin | S settings | q quit ",
-            Tab::Portfolio => " j/k scroll | Tab switch | Enter details | a edit | d remove | c add coin | S settings | q quit ",
+            Tab::Markets => " j/k \u{2195} | Tab \u{21c6} | Enter detail | f fav | a hold | / filter | s sort | A alert | c add | S set | q quit ",
+            Tab::Favourites => " j/k \u{2195} | Tab \u{21c6} | Enter detail | f unfav | a hold | / filter | s sort | A alert | c add | S set | q quit ",
+            Tab::Portfolio => " j/k \u{2195} | Tab \u{21c6} | Enter detail | a edit | d rm | b buy$ | / filter | s sort | A alert | c add | S set | q quit ",
         }
     };
 
     let mut spans = vec![Span::styled(hints, Style::default().fg(t.dim))];
 
+    // Show active filter indicator
+    if !app.filter_query.is_empty() && app.input_mode != InputMode::Filtering {
+        spans.push(Span::styled(
+            format!(" [/{}]", app.filter_query),
+            Style::default().fg(t.accent),
+        ));
+    }
+
     if let Some(ref err) = app.error {
         spans.push(Span::styled(
-            format!(" | {}", err),
+            format!(" \u{2502} {}", err),
             Style::default().fg(t.error),
         ));
     }
@@ -369,7 +487,7 @@ fn draw_popup(f: &mut Frame, app: &App) {
         None => return,
     };
 
-    let area = centered_rect(70, 60, f.area());
+    let area = centered_rect(75, 65, f.area());
     f.render_widget(Clear, area);
 
     let title = format!(" {} ({}) - {} ", coin.name, coin.symbol.to_uppercase(), app.chart_view.label());
@@ -383,6 +501,39 @@ fn draw_popup(f: &mut Frame, app: &App) {
     f.render_widget(block, area);
 
     let cache_key = (coin.id.clone(), app.chart_view.days());
+
+    // Build info section with supply + alerts
+    let mut info_lines: Vec<Line> = Vec::new();
+
+    // Supply info line
+    let circ = coin.circulating_supply.map(|v| format_large(v)).unwrap_or_else(|| "--".into());
+    let max_s = coin.max_supply.map(|v| format_large(v)).unwrap_or_else(|| "\u{221e}".into());
+    info_lines.push(Line::from(vec![
+        Span::styled(format!(" Supply: {} / {} ", circ, max_s), Style::default().fg(t.dim)),
+    ]));
+
+    // Active alerts for this coin
+    let coin_alerts: Vec<&PriceAlert> = app.alerts.iter().filter(|a| a.coin_id == coin.id && !a.triggered).collect();
+    if !coin_alerts.is_empty() {
+        let mut alert_spans = vec![Span::styled(" Alerts: ", Style::default().fg(t.dim))];
+        for (i, alert) in coin_alerts.iter().enumerate() {
+            if i > 0 {
+                alert_spans.push(Span::styled(", ", Style::default().fg(t.dim)));
+            }
+            let dir = match alert.direction {
+                AlertDirection::Above => "\u{25b2}",
+                AlertDirection::Below => "\u{25bc}",
+            };
+            alert_spans.push(Span::styled(
+                format!("{}{}", dir, format_price(alert.target_price)),
+                Style::default().fg(t.accent),
+            ));
+        }
+        info_lines.push(Line::from(alert_spans));
+    }
+
+    let info_height = info_lines.len() as u16;
+
     if let Some(history) = app.chart_cache.get(&cache_key) {
         if history.prices.is_empty() {
             let msg = Paragraph::new("  No price data available.")
@@ -393,7 +544,11 @@ fn draw_popup(f: &mut Frame, app: &App) {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .constraints([
+                Constraint::Length(3),           // stats
+                Constraint::Min(3),              // chart
+                Constraint::Length(info_height),  // supply + alerts
+            ])
             .split(inner);
 
         let first = history.prices.first().copied().unwrap_or(0.0);
@@ -420,9 +575,8 @@ fn draw_popup(f: &mut Frame, app: &App) {
 
         let spark_width = chunks[1].width as usize;
         let spark_height = chunks[1].height as usize;
-        let resolution = spark_height.max(1) as f64 * 8.0; // braille chars give 8 vertical levels per row
+        let resolution = spark_height.max(1) as f64 * 8.0;
 
-        // Downsample prices to match terminal width
         let sampled = downsample(&history.prices, spark_width);
 
         let spark_data: Vec<u64> = {
@@ -445,6 +599,10 @@ fn draw_popup(f: &mut Frame, app: &App) {
             .data(&spark_data)
             .style(Style::default().fg(spark_color));
         f.render_widget(sparkline, chunks[1]);
+
+        // Info section
+        let info_p = Paragraph::new(info_lines);
+        f.render_widget(info_p, chunks[2]);
     } else if app.loading_chart {
         let msg = Paragraph::new("  Loading chart data...")
             .style(Style::default().fg(t.dim));
@@ -492,13 +650,111 @@ fn draw_input_popup(f: &mut Frame, app: &App) {
     f.render_widget(input, inner);
 }
 
+// -- Alert popup --
+
+fn draw_alert_popup(f: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let coin = match app.selected_coin() {
+        Some(c) => c,
+        None => return,
+    };
+
+    let area = centered_rect(45, 5, f.area());
+    let area = Rect { height: area.height.max(7), ..area };
+    f.render_widget(Clear, area);
+
+    let title = format!(" {} alert ", coin.symbol.to_uppercase());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.input_accent));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // current price
+            Constraint::Length(1), // direction
+            Constraint::Length(1), // input
+            Constraint::Length(1), // hint
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let price_line = format!(" Current: {}", format_price(coin.current_price));
+    f.render_widget(
+        Paragraph::new(price_line).style(Style::default().fg(t.dim)),
+        chunks[0],
+    );
+
+    let dir_label = match app.alert_direction {
+        AlertDirection::Above => "\u{25b2} Above",
+        AlertDirection::Below => "\u{25bc} Below",
+    };
+    f.render_widget(
+        Paragraph::new(format!(" Direction: {} (Tab to toggle)", dir_label))
+            .style(Style::default().fg(t.accent)),
+        chunks[1],
+    );
+
+    let input_text = if app.alert_input_buf.is_empty() {
+        " Target: _".to_string()
+    } else {
+        format!(" Target: {}_", app.alert_input_buf)
+    };
+    f.render_widget(
+        Paragraph::new(input_text).style(Style::default().fg(t.fg)),
+        chunks[2],
+    );
+
+    f.render_widget(
+        Paragraph::new(" Enter save | Esc cancel").style(Style::default().fg(t.dim)),
+        chunks[3],
+    );
+}
+
+// -- Buy price popup --
+
+fn draw_buyprice_popup(f: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let coin = match app.selected_coin() {
+        Some(c) => c,
+        None => return,
+    };
+
+    let area = centered_rect(40, 5, f.area());
+    let area = Rect { height: area.height.max(5), ..area };
+    f.render_widget(Clear, area);
+
+    let title = format!(" {} buy price ", coin.symbol.to_uppercase());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.input_accent));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let text = if app.buy_price_buf.is_empty() {
+        "Enter buy-in price: _"
+    } else {
+        &app.buy_price_buf
+    };
+
+    let input = Paragraph::new(format!(" {}_", text.trim_end_matches('_')))
+        .style(Style::default().fg(t.fg));
+    f.render_widget(input, inner);
+}
+
 // -- Settings dialog --
 
 fn draw_settings(f: &mut Frame, app: &App) {
     let t = &app.theme;
     let area = f.area();
     let box_w = 60_u16.min(area.width.saturating_sub(4));
-    let box_h = 20_u16.min(area.height.saturating_sub(2));
+    let box_h = 26_u16.min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(box_w)) / 2;
     let y = (area.height.saturating_sub(box_h)) / 2;
     let popup = Rect::new(x, y, box_w, box_h);
@@ -529,73 +785,30 @@ fn draw_settings(f: &mut Frame, app: &App) {
             Constraint::Length(1), // [10] cmc label
             Constraint::Length(1), // [11] cmc value
             Constraint::Length(1), // [12] blank
-            Constraint::Length(1), // [13] hint
+            Constraint::Length(1), // [13] notifications label
+            Constraint::Length(1), // [14] notifications value
+            Constraint::Length(1), // [15] blank
+            Constraint::Length(1), // [16] ntfy topic label
+            Constraint::Length(1), // [17] ntfy topic value
+            Constraint::Length(1), // [18] blank
+            Constraint::Length(1), // [19] hint
             Constraint::Min(0),
         ])
         .split(inner);
 
     // -- Currency field --
-    {
-        let is_selected = app.settings_field == SettingsField::Currency;
-        let label_style = if is_selected {
-            Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(t.dim)
-        };
-        let marker = if is_selected { "\u{25b8} " } else { "  " };
-        let label = Paragraph::new(format!("{}Currency", marker)).style(label_style);
-        f.render_widget(label, chunks[1]);
-
-        let cur = CURRENCIES[app.settings_currency_idx];
-        let sym = currency_symbol(cur);
-        let val_spans = if is_selected {
-            Line::from(vec![
-                Span::styled("    \u{25c2} ", Style::default().fg(t.dim)),
-                Span::styled(
-                    format!("{} ({})", cur.to_uppercase(), sym),
-                    Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" \u{25b8}", Style::default().fg(t.dim)),
-            ])
-        } else {
-            Line::from(Span::styled(
-                format!("    {} ({})", cur.to_uppercase(), sym),
-                Style::default().fg(t.accent),
-            ))
-        };
-        f.render_widget(Paragraph::new(val_spans), chunks[2]);
-    }
+    draw_cycle_field(f, t, chunks[1], chunks[2],
+        app.settings_field == SettingsField::Currency,
+        "Currency",
+        &format!("{} ({})", CURRENCIES[app.settings_currency_idx].to_uppercase(), currency_symbol(CURRENCIES[app.settings_currency_idx])),
+    );
 
     // -- Theme field --
-    {
-        let is_selected = app.settings_field == SettingsField::Theme;
-        let label_style = if is_selected {
-            Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(t.dim)
-        };
-        let marker = if is_selected { "\u{25b8} " } else { "  " };
-        let label = Paragraph::new(format!("{}Theme", marker)).style(label_style);
-        f.render_widget(label, chunks[4]);
-
-        let theme_name = THEME_NAMES[app.settings_theme_idx];
-        let val_spans = if is_selected {
-            Line::from(vec![
-                Span::styled("    \u{25c2} ", Style::default().fg(t.dim)),
-                Span::styled(
-                    theme_name,
-                    Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" \u{25b8}", Style::default().fg(t.dim)),
-            ])
-        } else {
-            Line::from(Span::styled(
-                format!("    {}", theme_name),
-                Style::default().fg(t.accent),
-            ))
-        };
-        f.render_widget(Paragraph::new(val_spans), chunks[5]);
-    }
+    draw_cycle_field(f, t, chunks[4], chunks[5],
+        app.settings_field == SettingsField::Theme,
+        "Theme",
+        THEME_NAMES[app.settings_theme_idx],
+    );
 
     // -- API key fields --
     let api_fields: [(SettingsField, &String, usize, usize); 2] = [
@@ -604,59 +817,93 @@ fn draw_settings(f: &mut Frame, app: &App) {
     ];
 
     for (field, value, label_row, value_row) in &api_fields {
-        let is_selected = app.settings_field == *field;
-        let is_editing = is_selected && app.settings_editing;
-
-        let label_style = if is_selected {
-            Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(t.dim)
-        };
-
-        let marker = if is_selected { "\u{25b8} " } else { "  " };
-        let label = Paragraph::new(format!("{}{}", marker, field.label()))
-            .style(label_style);
-        f.render_widget(label, chunks[*label_row]);
-
-        let display_val = if value.is_empty() {
-            if is_editing { "_".to_string() } else { "(not set)".to_string() }
-        } else {
-            mask_key(value)
-        };
-
-        let val_text = if is_editing {
-            let full = if value.is_empty() {
-                String::new()
-            } else {
-                value.to_string()
-            };
-            format!("    {}_", full)
-        } else {
-            format!("    {}", display_val)
-        };
-
-        let val_style = if is_editing {
-            Style::default().fg(t.input_accent)
-        } else if value.is_empty() {
-            Style::default().fg(t.dim)
-        } else {
-            Style::default().fg(t.accent)
-        };
-
-        let val_p = Paragraph::new(val_text).style(val_style);
-        f.render_widget(val_p, chunks[*value_row]);
+        draw_text_field(f, t, chunks[*label_row], chunks[*value_row],
+            app.settings_field == *field, app.settings_editing && app.settings_field == *field,
+            field.label(), value, true,
+        );
     }
+
+    // -- Notification method --
+    draw_cycle_field(f, t, chunks[13], chunks[14],
+        app.settings_field == SettingsField::Notifications,
+        "Notifications",
+        NOTIFICATION_METHODS[app.settings_notification_idx],
+    );
+
+    // -- Ntfy topic --
+    draw_text_field(f, t, chunks[16], chunks[17],
+        app.settings_field == SettingsField::NtfyTopic,
+        app.settings_editing && app.settings_field == SettingsField::NtfyTopic,
+        "Ntfy Topic",
+        &app.settings_ntfy_topic,
+        false,
+    );
 
     let hint = if app.settings_editing {
         "  Enter/Esc finish editing"
-    } else if app.settings_field == SettingsField::Currency || app.settings_field == SettingsField::Theme {
+    } else if app.settings_field.is_cycle_field() {
         "  h/l change | s save & close | Esc cancel"
     } else {
         "  Enter edit | s save & close | Esc cancel"
     };
     let hint_p = Paragraph::new(hint)
         .style(Style::default().fg(t.dim));
-    f.render_widget(hint_p, chunks[13]);
+    f.render_widget(hint_p, chunks[19]);
+}
+
+fn draw_cycle_field(f: &mut Frame, t: &crate::theme::Theme, label_area: Rect, value_area: Rect, is_selected: bool, label: &str, value: &str) {
+    let label_style = if is_selected {
+        Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(t.dim)
+    };
+    let marker = if is_selected { "\u{25b8} " } else { "  " };
+    f.render_widget(Paragraph::new(format!("{}{}", marker, label)).style(label_style), label_area);
+
+    let val_spans = if is_selected {
+        Line::from(vec![
+            Span::styled("    \u{25c2} ", Style::default().fg(t.dim)),
+            Span::styled(value, Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+            Span::styled(" \u{25b8}", Style::default().fg(t.dim)),
+        ])
+    } else {
+        Line::from(Span::styled(format!("    {}", value), Style::default().fg(t.accent)))
+    };
+    f.render_widget(Paragraph::new(val_spans), value_area);
+}
+
+fn draw_text_field(f: &mut Frame, t: &crate::theme::Theme, label_area: Rect, value_area: Rect, is_selected: bool, is_editing: bool, label: &str, value: &str, mask: bool) {
+    let label_style = if is_selected {
+        Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(t.dim)
+    };
+    let marker = if is_selected { "\u{25b8} " } else { "  " };
+    f.render_widget(Paragraph::new(format!("{}{}", marker, label)).style(label_style), label_area);
+
+    let display_val = if value.is_empty() {
+        if is_editing { "_".to_string() } else { "(not set)".to_string() }
+    } else if mask {
+        mask_key(value)
+    } else {
+        value.to_string()
+    };
+
+    let val_text = if is_editing {
+        format!("    {}_", if value.is_empty() { "" } else { value })
+    } else {
+        format!("    {}", display_val)
+    };
+
+    let val_style = if is_editing {
+        Style::default().fg(t.input_accent)
+    } else if value.is_empty() {
+        Style::default().fg(t.dim)
+    } else {
+        Style::default().fg(t.accent)
+    };
+
+    f.render_widget(Paragraph::new(val_text).style(val_style), value_area);
 }
 
 fn draw_search(f: &mut Frame, app: &App) {

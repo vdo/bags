@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-use crate::types::Holding;
+use crate::types::{AlertDirection, Holding, PriceAlert};
 
 pub struct Db {
     conn: Connection,
@@ -42,8 +42,18 @@ impl Db {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS price_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                target_price REAL NOT NULL,
+                direction TEXT NOT NULL DEFAULT 'above',
+                triggered INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+
+        // Migration: add buy_price column if it doesn't exist
+        let _ = conn.execute_batch("ALTER TABLE holdings ADD COLUMN buy_price REAL");
 
         Ok(Self { conn })
     }
@@ -91,17 +101,26 @@ impl Db {
 
     // -- Holdings --
 
-    pub fn set_holding(&self, coin_id: &str, amount: f64) -> Result<()> {
+    pub fn set_holding(&self, coin_id: &str, amount: f64, buy_price: Option<f64>) -> Result<()> {
         if amount <= 0.0 {
             self.conn
                 .execute("DELETE FROM holdings WHERE coin_id = ?1", [coin_id])?;
         } else {
             self.conn.execute(
-                "INSERT INTO holdings (coin_id, amount) VALUES (?1, ?2)
-                 ON CONFLICT(coin_id) DO UPDATE SET amount = excluded.amount",
-                rusqlite::params![coin_id, amount],
+                "INSERT INTO holdings (coin_id, amount, buy_price) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(coin_id) DO UPDATE SET amount = excluded.amount,
+                 buy_price = COALESCE(excluded.buy_price, holdings.buy_price)",
+                rusqlite::params![coin_id, amount, buy_price],
             )?;
         }
+        Ok(())
+    }
+
+    pub fn set_buy_price(&self, coin_id: &str, price: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE holdings SET buy_price = ?1 WHERE coin_id = ?2",
+            rusqlite::params![price, coin_id],
+        )?;
         Ok(())
     }
 
@@ -134,11 +153,12 @@ impl Db {
     pub fn get_holdings(&self) -> Result<Vec<Holding>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT coin_id, amount FROM holdings WHERE amount > 0")?;
+            .prepare("SELECT coin_id, amount, buy_price FROM holdings WHERE amount > 0")?;
         let rows = stmt.query_map([], |row| {
             Ok(Holding {
                 coin_id: row.get(0)?,
                 amount: row.get(1)?,
+                buy_price: row.get(2)?,
             })
         })?;
         let mut out = Vec::new();
@@ -146,6 +166,58 @@ impl Db {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // -- Price Alerts --
+
+    pub fn add_alert(&self, coin_id: &str, target_price: f64, direction: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO price_alerts (coin_id, target_price, direction) VALUES (?1, ?2, ?3)",
+            rusqlite::params![coin_id, target_price, direction],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_alerts(&self) -> Result<Vec<PriceAlert>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT coin_id, target_price, direction, triggered FROM price_alerts")?;
+        let rows = stmt.query_map([], |row| {
+            let dir_str: String = row.get(2)?;
+            let direction = if dir_str == "below" {
+                AlertDirection::Below
+            } else {
+                AlertDirection::Above
+            };
+            Ok(PriceAlert {
+                coin_id: row.get(0)?,
+                target_price: row.get(1)?,
+                direction,
+                triggered: row.get::<_, i32>(3)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_alert_triggered(&self, coin_id: &str, target_price: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE price_alerts SET triggered = 1 WHERE coin_id = ?1 AND target_price = ?2",
+            rusqlite::params![coin_id, target_price],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_alert(&self, coin_id: &str, target_price: f64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM price_alerts WHERE coin_id = ?1 AND target_price = ?2",
+            rusqlite::params![coin_id, target_price],
+        )?;
+        Ok(())
     }
 
 }

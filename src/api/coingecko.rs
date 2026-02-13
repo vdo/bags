@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
-use crate::types::{Coin, PriceHistory, SearchResult};
+use crate::types::{Coin, GlobalMarketStats, PriceHistory, SearchResult};
 
 const BASE_URL: &str = "https://api.coingecko.com/api/v3";
 const PRO_BASE_URL: &str = "https://pro-api.coingecko.com/api/v3";
@@ -180,5 +180,64 @@ impl CoinGeckoClient {
 
         let coins: Vec<Coin> = resp.json().await.context("Failed to parse coin data")?;
         Ok(coins.into_iter().next())
+    }
+
+    pub async fn fetch_global(&self) -> Result<GlobalMarketStats> {
+        let url = format!("{}/global", self.base_url());
+        let url = self.apply_key(&url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Failed to reach CoinGecko API")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("CoinGecko API error {}: {}", status, body);
+        }
+
+        let data: serde_json::Value = resp.json().await?;
+        let d = &data["data"];
+
+        let total_market_cap = d["total_market_cap"]["usd"]
+            .as_f64()
+            .unwrap_or(0.0);
+        let btc_dominance = d["market_cap_percentage"]["btc"]
+            .as_f64()
+            .unwrap_or(0.0);
+
+        Ok(GlobalMarketStats {
+            total_market_cap_usd: total_market_cap,
+            btc_dominance,
+            fear_greed_index: None,
+            fear_greed_label: None,
+        })
+    }
+
+    pub async fn fetch_fear_greed(&self) -> Result<(u32, String)> {
+        let resp = self
+            .client
+            .get("https://api.alternative.me/fng/")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Failed to reach Fear & Greed API")?;
+
+        let data: serde_json::Value = resp.json().await?;
+        let entry = &data["data"][0];
+        let value = entry["value"]
+            .as_str()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let label = entry["value_classification"]
+            .as_str()
+            .unwrap_or("Unknown")
+            .to_string();
+
+        Ok((value, label))
     }
 }

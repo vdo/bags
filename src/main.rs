@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod config;
 mod db;
+mod notifications;
 mod theme;
 mod types;
 mod ui;
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -167,6 +168,11 @@ async fn run_app(
     let client = CoinGeckoClient::new(&app.config.currency, &app.coingecko_api_key);
     app.refresh_db_state().await;
     app.refresh_market_data(&client).await;
+    app.refresh_alerts().await;
+    app.check_alerts();
+
+    // Fetch global stats in background (non-blocking)
+    app.refresh_global_stats(&client).await;
 
     run_main_loop(terminal, app, client).await
 }
@@ -178,11 +184,20 @@ async fn run_main_loop(
 ) -> Result<()> {
     let tick_rate = Duration::from_millis(250);
 
+    // Track layout info for mouse clicks
+    let mut top_bar_height: u16 = 3;
+    let mut bottom_bar_y: u16 = 0;
+
     loop {
         let refresh_dur = Duration::from_secs(app.config.refresh_interval_secs);
         app.update_refresh_display();
 
-        terminal.draw(|f| ui::draw(f, &mut *app))?;
+        terminal.draw(|f| {
+            let area = f.area();
+            top_bar_height = 3;
+            bottom_bar_y = area.height.saturating_sub(1);
+            ui::draw(f, &mut *app);
+        })?;
 
         // Auto-refresh
         if let Some(last) = app.last_refresh {
@@ -190,16 +205,168 @@ async fn run_main_loop(
                 app.refresh_market_data(&client).await;
                 app.refresh_db_state().await;
                 app.clamp_selection();
+                app.check_alerts();
+                app.refresh_global_stats(&client).await;
             }
         }
 
         if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            // Handle mouse events
+            if let Event::Mouse(mouse) = ev {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if app.input_mode == InputMode::Normal && !app.popup_open && !app.sort_picking {
+                            let row = mouse.row;
+                            let col = mouse.column;
+
+                            // Click on top bar tabs
+                            if row < top_bar_height {
+                                // Rough tab click detection based on position
+                                let tabs_start = 10_u16; // after "[bags] | "
+                                if col >= tabs_start {
+                                    let rel = col - tabs_start;
+                                    if rel < 7 { // "Markets"
+                                        app.tab = Tab::Markets;
+                                        app.selected = 0;
+                                        app.clamp_selection();
+                                    } else if rel < 22 { // " . Favourites"
+                                        app.tab = Tab::Favourites;
+                                        app.selected = 0;
+                                        app.clamp_selection();
+                                    } else if rel < 36 { // " . Portfolio"
+                                        app.tab = Tab::Portfolio;
+                                        app.selected = 0;
+                                        app.clamp_selection();
+                                    }
+                                }
+                            }
+                            // Click on table rows (below header, above bottom bar)
+                            else if row >= top_bar_height + 1 && row < bottom_bar_y {
+                                let table_row = (row - top_bar_height - 1) as usize;
+                                let target = app.scroll_offset + table_row;
+                                let visible_len = app.visible_coins().len();
+                                if target < visible_len {
+                                    app.selected = target;
+                                    app.adjust_scroll();
+                                }
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if app.input_mode == InputMode::Normal && !app.popup_open {
+                            let len = app.visible_coins().len();
+                            if len > 0 {
+                                app.selected = (app.selected + 3).min(len - 1);
+                            }
+                            app.adjust_scroll();
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if app.input_mode == InputMode::Normal && !app.popup_open {
+                            app.selected = app.selected.saturating_sub(3);
+                            app.adjust_scroll();
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if let Event::Key(key) = ev {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     app.quit = true;
                 }
 
                 match app.input_mode {
+                    InputMode::Filtering => match key.code {
+                        KeyCode::Esc => {
+                            app.filter_query.clear();
+                            app.input_mode = InputMode::Normal;
+                            app.clamp_selection();
+                        }
+                        KeyCode::Enter => {
+                            app.input_mode = InputMode::Normal;
+                            app.selected = 0;
+                            app.clamp_selection();
+                        }
+                        KeyCode::Backspace => {
+                            app.filter_query.pop();
+                            app.selected = 0;
+                            app.clamp_selection();
+                        }
+                        KeyCode::Char(c) => {
+                            app.filter_query.push(c);
+                            app.selected = 0;
+                            app.clamp_selection();
+                        }
+                        _ => {}
+                    },
+                    InputMode::EditingAlert => match key.code {
+                        KeyCode::Esc => {
+                            app.input_mode = InputMode::Normal;
+                            app.alert_input_buf.clear();
+                        }
+                        KeyCode::Tab => {
+                            app.alert_direction = match app.alert_direction {
+                                AlertDirection::Above => AlertDirection::Below,
+                                AlertDirection::Below => AlertDirection::Above,
+                            };
+                        }
+                        KeyCode::Enter => {
+                            if let Ok(price) = app.alert_input_buf.trim().parse::<f64>() {
+                                if let Some(coin) = app.selected_coin() {
+                                    let coin_id = coin.id.clone();
+                                    let dir_str = match app.alert_direction {
+                                        AlertDirection::Above => "above",
+                                        AlertDirection::Below => "below",
+                                    };
+                                    if let Some(ref db) = app.db {
+                                        let db = db.lock().await;
+                                        let _ = db.add_alert(&coin_id, price, dir_str);
+                                    }
+                                    app.refresh_alerts().await;
+                                }
+                            }
+                            app.input_mode = InputMode::Normal;
+                            app.alert_input_buf.clear();
+                        }
+                        KeyCode::Backspace => {
+                            app.alert_input_buf.pop();
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                            app.alert_input_buf.push(c);
+                        }
+                        _ => {}
+                    },
+                    InputMode::EditingBuyPrice => match key.code {
+                        KeyCode::Esc => {
+                            app.input_mode = InputMode::Normal;
+                            app.buy_price_buf.clear();
+                        }
+                        KeyCode::Enter => {
+                            if let Ok(price) = app.buy_price_buf.trim().parse::<f64>() {
+                                if let Some(coin) = app.selected_coin() {
+                                    let coin_id = coin.id.clone();
+                                    if let Some(ref db) = app.db {
+                                        let db = db.lock().await;
+                                        let _ = db.set_buy_price(&coin_id, price);
+                                    }
+                                    app.refresh_db_state().await;
+                                }
+                            }
+                            app.input_mode = InputMode::Normal;
+                            app.buy_price_buf.clear();
+                        }
+                        KeyCode::Backspace => {
+                            app.buy_price_buf.pop();
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                            app.buy_price_buf.push(c);
+                        }
+                        _ => {}
+                    },
                     InputMode::EditingAmount => match key.code {
                         KeyCode::Esc => {
                             app.input_mode = InputMode::Normal;
@@ -209,9 +376,17 @@ async fn run_main_loop(
                             if let Ok(amount) = app.input_buf.trim().parse::<f64>() {
                                 if let Some(coin) = app.selected_coin() {
                                     let coin_id = coin.id.clone();
+                                    let current_price = coin.current_price;
+                                    // Auto-record buy price if this is a new holding
+                                    let existing = app.holding_for(&coin_id);
+                                    let buy_price = if existing <= 0.0 && amount > 0.0 {
+                                        Some(current_price)
+                                    } else {
+                                        None
+                                    };
                                     if let Some(ref db) = app.db {
                                         let db = db.lock().await;
-                                        let _ = db.set_holding(&coin_id, amount);
+                                        let _ = db.set_holding(&coin_id, amount, buy_price);
                                     }
                                     app.refresh_db_state().await;
                                 }
@@ -310,6 +485,41 @@ async fn run_main_loop(
                         }
                         _ => {}
                     },
+                    InputMode::Normal if app.sort_picking => {
+                        app.sort_picking = false;
+                        match key.code {
+                            KeyCode::Char('r') | KeyCode::Char('#') => {
+                                toggle_sort(app, SortColumn::Rank);
+                            }
+                            KeyCode::Char('n') => {
+                                toggle_sort(app, SortColumn::Name);
+                            }
+                            KeyCode::Char('p') => {
+                                toggle_sort(app, SortColumn::Price);
+                            }
+                            KeyCode::Char('1') => {
+                                toggle_sort(app, SortColumn::Change1h);
+                            }
+                            KeyCode::Char('2') => {
+                                toggle_sort(app, SortColumn::Change24h);
+                            }
+                            KeyCode::Char('7') => {
+                                toggle_sort(app, SortColumn::Change7d);
+                            }
+                            KeyCode::Char('v') => {
+                                toggle_sort(app, SortColumn::Volume);
+                            }
+                            KeyCode::Char('m') => {
+                                toggle_sort(app, SortColumn::MarketCap);
+                            }
+                            KeyCode::Esc => {
+                                app.sort_column = None;
+                            }
+                            _ => {}
+                        }
+                        app.selected = 0;
+                        app.clamp_selection();
+                    }
                     InputMode::Normal if app.popup_open => match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => {
                             app.popup_open = false;
@@ -326,7 +536,40 @@ async fn run_main_loop(
                     },
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => app.quit = true,
-                        KeyCode::Esc => app.quit = true,
+                        KeyCode::Esc => {
+                            if !app.filter_query.is_empty() {
+                                app.filter_query.clear();
+                                app.selected = 0;
+                                app.clamp_selection();
+                            } else {
+                                app.quit = true;
+                            }
+                        }
+                        KeyCode::Char('/') => {
+                            app.filter_query.clear();
+                            app.input_mode = InputMode::Filtering;
+                        }
+                        KeyCode::Char('s') => {
+                            app.sort_picking = true;
+                        }
+                        KeyCode::Char('A') => {
+                            if app.selected_coin().is_some() {
+                                app.alert_input_buf.clear();
+                                app.alert_direction = AlertDirection::Above;
+                                app.input_mode = InputMode::EditingAlert;
+                            }
+                        }
+                        KeyCode::Char('b') => {
+                            if let Some(coin) = app.selected_coin() {
+                                let coin_id = coin.id.clone();
+                                if app.holding_for(&coin_id) > 0.0 {
+                                    app.buy_price_buf = app.buy_price_for(&coin_id)
+                                        .map(|p| format!("{}", p))
+                                        .unwrap_or_default();
+                                    app.input_mode = InputMode::EditingBuyPrice;
+                                }
+                            }
+                        }
                         KeyCode::Tab => {
                             app.tab = app.tab.next();
                             app.selected = 0;
@@ -422,7 +665,7 @@ async fn run_main_loop(
                                 let coin_id = coin.id.clone();
                                 if let Some(ref db) = app.db {
                                     let db = db.lock().await;
-                                    let _ = db.set_holding(&coin_id, 0.0);
+                                    let _ = db.set_holding(&coin_id, 0.0, None);
                                 }
                                 app.refresh_db_state().await;
                                 app.clamp_selection();
@@ -433,6 +676,8 @@ async fn run_main_loop(
                             app.refresh_market_data(&client).await;
                             app.refresh_db_state().await;
                             app.clamp_selection();
+                            app.check_alerts();
+                            app.refresh_global_stats(&client).await;
                         }
                         KeyCode::Char('S') => {
                             app.open_settings();
@@ -457,6 +702,21 @@ async fn run_main_loop(
     }
 
     Ok(())
+}
+
+fn toggle_sort(app: &mut App, col: SortColumn) {
+    if app.sort_column == Some(col) {
+        match app.sort_direction {
+            SortDirection::Asc => app.sort_direction = SortDirection::Desc,
+            SortDirection::Desc => {
+                app.sort_column = None;
+                app.sort_direction = SortDirection::Asc;
+            }
+        }
+    } else {
+        app.sort_column = Some(col);
+        app.sort_direction = SortDirection::Asc;
+    }
 }
 
 async fn handle_settings_key(app: &mut App, key: KeyCode, client: &mut CoinGeckoClient) {
@@ -499,17 +759,19 @@ async fn handle_settings_key(app: &mut App, key: KeyCode, client: &mut CoinGecko
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                if app.settings_field == SettingsField::Currency {
-                    app.cycle_currency(false);
-                } else if app.settings_field == SettingsField::Theme {
-                    app.cycle_theme(false);
+                match app.settings_field {
+                    SettingsField::Currency => app.cycle_currency(false),
+                    SettingsField::Theme => app.cycle_theme(false),
+                    SettingsField::Notifications => app.cycle_notification(false),
+                    _ => {}
                 }
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                if app.settings_field == SettingsField::Currency {
-                    app.cycle_currency(true);
-                } else if app.settings_field == SettingsField::Theme {
-                    app.cycle_theme(true);
+                match app.settings_field {
+                    SettingsField::Currency => app.cycle_currency(true),
+                    SettingsField::Theme => app.cycle_theme(true),
+                    SettingsField::Notifications => app.cycle_notification(true),
+                    _ => {}
                 }
             }
             KeyCode::Char('s') => {
@@ -517,18 +779,23 @@ async fn handle_settings_key(app: &mut App, key: KeyCode, client: &mut CoinGecko
                 let new_currency = CURRENCIES[app.settings_currency_idx].to_string();
                 let new_theme_name = theme::THEME_NAMES[app.settings_theme_idx].to_string();
                 let currency_changed = new_currency != app.config.currency;
+                let new_notif = NOTIFICATION_METHODS[app.settings_notification_idx];
 
                 if let Some(ref db) = app.db {
                     let db = db.lock().await;
                     let _ = db.set_setting("coingecko_api_key", &app.settings_coingecko_key);
                     let _ = db.set_setting("cmc_api_key", &app.settings_cmc_key);
                     let _ = db.set_setting("currency", &new_currency);
+                    let _ = db.set_setting("notification_method", new_notif);
+                    let _ = db.set_setting("ntfy_topic", &app.settings_ntfy_topic);
                 }
                 app.coingecko_api_key = app.settings_coingecko_key.clone();
                 app.cmc_api_key = app.settings_cmc_key.clone();
                 app.config.currency = new_currency;
                 app.config.theme = new_theme_name.clone();
                 app.theme = theme::by_name(&new_theme_name);
+                app.notification_method = notification_method_from_str(new_notif);
+                app.ntfy_topic = app.settings_ntfy_topic.clone();
                 let _ = app.config.save();
 
                 // Recreate client with new key/currency
