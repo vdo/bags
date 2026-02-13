@@ -53,18 +53,15 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
 
-      - name: Package
+      - name: Rename binary
         shell: bash
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czvf ../../../bags-${{ github.ref_name }}-${{ matrix.target }}.tar.gz bags
-          cd -
+        run: cp target/${{ matrix.target }}/release/bags bags-${{ github.ref_name }}-${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bags-${{ matrix.target }}
-          path: bags-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: bags-${{ github.ref_name }}-${{ matrix.target }}
 
   release:
     name: Create Release
