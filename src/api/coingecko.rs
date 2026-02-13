@@ -32,12 +32,11 @@ impl CoinGeckoClient {
         }
     }
 
-    fn apply_key(&self, url: &str) -> String {
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if self.api_key.is_empty() {
-            url.to_string()
+            req
         } else {
-            let sep = if url.contains('?') { "&" } else { "?" };
-            format!("{}{}x_cg_pro_api_key={}", url, sep, self.api_key)
+            req.header("x-cg-pro-api-key", &self.api_key)
         }
     }
 
@@ -46,11 +45,8 @@ impl CoinGeckoClient {
             "{}/coins/markets?vs_currency={}&order=market_cap_desc&per_page={}&page=1&sparkline=false&price_change_percentage=1h,24h,7d",
             self.base_url(), self.currency, limit
         );
-        let url = self.apply_key(&url);
-
         let resp = self
-            .client
-            .get(&url)
+            .apply_auth(self.client.get(&url))
             .header("Accept", "application/json")
             .send()
             .await
@@ -81,11 +77,8 @@ impl CoinGeckoClient {
             "{}/coins/{}/market_chart?vs_currency={}&days={}",
             self.base_url(), coin_id, self.currency, days
         );
-        let url = self.apply_key(&url);
-
         let resp = self
-            .client
-            .get(&url)
+            .apply_auth(self.client.get(&url))
             .header("Accept", "application/json")
             .send()
             .await
@@ -120,11 +113,8 @@ impl CoinGeckoClient {
             self.base_url(),
             query
         );
-        let url = self.apply_key(&url);
-
         let resp = self
-            .client
-            .get(&url)
+            .apply_auth(self.client.get(&url))
             .header("Accept", "application/json")
             .send()
             .await
@@ -162,11 +152,8 @@ impl CoinGeckoClient {
             "{}/coins/markets?vs_currency={}&ids={}&sparkline=false&price_change_percentage=1h,24h,7d",
             self.base_url(), self.currency, coin_id
         );
-        let url = self.apply_key(&url);
-
         let resp = self
-            .client
-            .get(&url)
+            .apply_auth(self.client.get(&url))
             .header("Accept", "application/json")
             .send()
             .await
@@ -184,11 +171,9 @@ impl CoinGeckoClient {
 
     pub async fn fetch_global(&self) -> Result<GlobalMarketStats> {
         let url = format!("{}/global", self.base_url());
-        let url = self.apply_key(&url);
 
         let resp = self
-            .client
-            .get(&url)
+            .apply_auth(self.client.get(&url))
             .header("Accept", "application/json")
             .send()
             .await
