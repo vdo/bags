@@ -1,4 +1,4 @@
-# bags
+# bags ⚉
 
 A crypto price and portfolio tracker for the terminal.
 
